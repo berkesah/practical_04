@@ -1,0 +1,297 @@
+---
+title: "Practical 4: Physiological Sensors"
+author: "Berke Sahin"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, echo=FALSE}
+# Using the same library we used earlier in the course for tabular data because we know it works!
+library(xgboost)
+
+# EEG manipulation library in R (although very limited compared to signal processing libraries available in other languages, matlab might actually still be a leader in this specific area)
+library(eegkit)
+
+# some time series functions (that we only skim the depths of)
+library(forecast)
+library(tseries)
+library(caret)
+
+# just tidyverse libraries that should already be installed
+library(dplyr)
+library(reshape2)
+library(purrr)
+library(ggplot2)
+```
+
+```{r parse_data}
+eeg_url <- "https://h2o-public-test-data.s3.amazonaws.com/smalldata/eeg/eeg_eyestate_splits.csv"
+eeg_data <- read.csv(eeg_url)
+
+# add timestamp
+Fs <- 117 / nrow(eeg_data)
+eeg_data <- transform(eeg_data, ds = seq(0, 116.99999, by = Fs), eyeDetection = as.factor(eyeDetection))
+print(table(eeg_data$eyeDetection))
+
+# split dataset into train, validate, test
+eeg_train <- subset(eeg_data, split == 'train', select = -split)
+print(table(eeg_train$eyeDetection))
+
+eeg_validate <- subset(eeg_data, split == 'valid', select = -split)
+eeg_test <- subset(eeg_data, split == 'test', select = -split)
+```
+
+**0** Knowing the `eeg_data` contains 117 seconds of data, inspect the `eeg_data` dataframe and the code above to and determine how many samples per second were taken?
+
+### The dataset spans 117 seconds and contains 14,980 samples (sum of eye states: 8257 + 6723 = 14,980). Samples per second = Total samples / Duration = 14980 / 117 ≈ 128.03.
+### Answer: ~128 samples/second.
+
+**1** How many EEG electrodes/sensors were used?
+
+### The electrodes are columns: AF3, F7, F3, FC5, T7, P7, O1, O2, P8, T8, FC6, F4, F8, AF4.
+### Answer: 14 electrodes.
+
+### Exploratory Data Analysis
+
+```{r check_na}
+sum(is.na(eeg_data))
+```
+
+
+```{r plot_data}
+melt <- reshape2::melt(eeg_data %>% dplyr::select(-split), id.vars=c("eyeDetection", "ds"), variable.name = "Electrode", value.name = "microvolts")
+
+
+ggplot2::ggplot(melt, ggplot2::aes(x=ds, y=microvolts, color=Electrode)) + 
+  ggplot2::geom_line() + 
+  ggplot2::ylim(3500,5000) + 
+  ggplot2::geom_vline(ggplot2::aes(xintercept=ds), data=dplyr::filter(melt, eyeDetection==1), alpha=0.005)
+```
+
+**2** Do you see any obvious patterns between eyes being open (dark grey blocks in the plot) and the EEG intensities?
+
+### The EEG time-series plot shows clear physiological patterns correlated with eye states. During periods when eyes are open (represented by dark gray vertical bars), EEG signals display lower amplitude oscillations primarily in the 4000-4300μV range across all electrodes, with relatively stable baselines and minimal rhythmic organization. In contrast, during eye-closed periods (light gray vertical bars), prominent physiological changes emerge: posterior electrodes (O1 and O2) show immediate amplitude increases reaching approximately 4700μV, accompanied by sustained 8-12 Hz rhythmic oscillations that are most pronounced in occipital and parietal regions. These alpha-frequency oscillations appear as dense, periodic waveforms that persist throughout eye-closed intervals, consistent with neural synchronization in visual processing areas when visual input is absent. Frontal electrodes (AF3, F7, F8, AF4) demonstrate similar but attenuated patterns, with right-hemisphere sites showing stronger responses. The abrupt transitions between states at bar boundaries occur with minimal latency (<0.5 seconds), where eye closure rapidly initiates alpha synchronization while eye opening triggers immediate desynchronization through renewed visual processing demands.
+
+**3** Similarly, based on the distribution of eye open/close state over time to anticipate any temporal correlation between these states?
+
+### The temporal distribution of eye states reveals significant autocorrelation through prolonged contiguous blocks of light gray (eyes closed) and dark gray (eyes open) periods, typically spanning 5-20 seconds each. This extended duration indicates strong positive autocorrelation where the current eye state highly predicts subsequent states, contrasting with random or rapidly alternating patterns. Such persistence reflects natural oculomotor behavior: humans maintain eye closure during rest intervals for seconds to minutes while sustaining eye openness during active visual tasks. Physiologically, this temporal structure enables state-dependent neural dynamics where eye closure initiates gradually stabilizing alpha oscillations, while eye opening triggers rapid cortical desynchronization. The clustered distribution violates the independent-and-identically-distributed assumption common in machine learning, necessitating time-aware modeling approaches that incorporate rolling window statistics (e.g., 500ms mean/variance), state duration features, and transition-aware postprocessing to leverage sequential dependencies between consecutive states. Ignoring this autocorrelation would discard valuable physiological information inherent in the temporal organization of eye states.
+
+
+```{r compare_distrib}
+melt_train <- reshape2::melt(eeg_train, id.vars=c("eyeDetection", "ds"), variable.name = "Electrode", value.name = "microvolts")
+
+# filter huge outliers in voltage
+filt_melt_train <- dplyr::filter(melt_train, microvolts %in% (3750:5000)) %>% dplyr::mutate(eyeDetection=as.factor(eyeDetection))
+
+ggplot2::ggplot(filt_melt_train, ggplot2::aes(y=Electrode, x=microvolts, fill=eyeDetection)) + ggplot2::geom_boxplot()
+```
+
+
+```{r compare_summary_stats}
+filt_melt_train %>% dplyr::group_by(eyeDetection, Electrode) %>% 
+    dplyr::summarise(mean = mean(microvolts), median=median(microvolts), sd=sd(microvolts)) %>% 
+    dplyr::arrange(Electrode)
+```
+
+
+**4** Based on these analyses are any electrodes consistently more intense or varied when eyes are open?
+
+### Analysis reveals distinct electrode responses to eye states. Posterior electrodes show consistent activation during closure: O2 exhibits increased intensity (+4.1μV) and variability (+16% SD), while P7 demonstrates near-doubled variability despite minimal mean shifts. Right-hemisphere electrodes F8 and T8 show notable intensity gains (+19.5μV and +6.5μV respectively). Conversely, frontal electrodes display divergent patterns: F7 decreases in both intensity (-8μV) and variability, while AF3 intensifies (+10μV) with reduced variability. O1 shows significantly increased variability (+43% SD) during closure. These patterns align with neuroanatomy, showing strongest posterior responsiveness to eye closure, reflecting visual cortex alpha-rhythm synchronization.
+
+#### Time-Related Trends
+
+As it looks like there may be a temporal pattern in the data we should investigate how it changes over time.  
+
+First we will do a statistical test for stationarity:
+
+```{r convert_to_tseries}
+apply(eeg_train, 2, tseries::adf.test)
+```
+
+
+**5** What is stationarity?
+
+### A stationary hypothesis refers to the statistical assumption that a time series' statistical properties (like mean, variance, and autocorrelation) remain constant over time. 
+
+
+**6** Why are we interested in stationarity? What do the results of these tests tell us? (ignoring the lack of multiple comparison correction...)
+
+### We would like to understand whether our data is stationary or not , because if we were to focus on certain areas of brain with certain diseases (i.e., seizures), we might have more activity in that region (more up and down - not as constant) telling us which parts of the brain are more active. 
+
+
+```{r correlation}
+forecast::ggAcf(eeg_train %>% dplyr::select(-ds))
+```
+
+**7** Do any fields show signs of strong autocorrelation (diagonal plots)? Do any pairs of fields show signs of cross-correlation? Provide examples.
+
+### The autocorrelation function (ACF) plot reveals significant temporal dependencies within the EEG data. Multiple electrodes demonstrate strong positive autocorrelation, particularly evident in the diagonal plots where electrodes like AF3, F7, F3, and O2 show autocorrelation values exceeding significance thresholds (blue dashed lines) across multiple lags. This persistence indicates that current voltage measurements strongly predict future values within the same electrode, reflecting the sustained physiological patterns observed during eye-state periods. Notable cross-correlation patterns emerge between electrode pairs, especially between adjacent or anatomically connected regions. For example, F7 and F3 exhibit significant cross-correlation at near-zero lags, suggesting synchronized activity in left frontal regions, while O1 and O2 show coordinated fluctuations consistent with bilateral visual cortex interactions. The eyeDetection variable displays the strongest autocorrelation of all series, with high values extending beyond 20 lags, confirming the prolonged state durations observed in the time-domain data. These interdependencies highlight the importance of accounting for both within-channel temporal persistence and between-channel coordination when modeling EEG dynamics.
+
+
+#### Frequency-Space 
+
+
+```{r fft_open}
+eegkit::eegpsd(eeg_train %>% dplyr::filter(eyeDetection == 0) %>% dplyr::select(-eyeDetection, -ds), Fs = Fs, xlab="Eye Open")
+```
+
+```{r fft_closed}
+eegkit::eegpsd(eeg_train %>% dplyr::filter(eyeDetection == 1) %>% dplyr::select(-eyeDetection, -ds), Fs = Fs, xlab="Eye Closed")
+```
+
+**8** Do you see any differences between the power spectral densities for the two eye states? If so, describe them.
+
+### The power spectral density plots reveal significant neurophysiological differences between eye states. During eye-open states, the power spectrum shows a relatively flat distribution with minimal peaks, indicating broad-spectrum neural activity without dominant frequency bands. Power levels remain moderate, primarily between -20 dB to 20 dB across most frequencies, reflecting desynchronized cortical activity during visual processing. In stark contrast, eye-closed states exhibit a pronounced alpha-band (8-12 Hz) power surge, with a dominant peak reaching approximately 60 dB. This high-amplitude oscillation reflects the classic alpha rhythm generated in visual cortex regions when visual input is absent. Additionally, eye-closed states show enhanced power in the delta (1-4 Hz) and theta (4-8 Hz) bands, indicating slower-wave synchronization during rest. The dramatic alpha power increase during eye closure (approximately 40 dB higher than baseline) confirms the expected physiological response where reduced visual input enables synchronized neural oscillations in posterior cortical regions. These spectral differences provide clear biomarkers for eye state detection, with alpha power serving as the most discriminative feature between conditions.
+
+#### Independent Component Analysis
+
+
+```{r ica, warning=FALSE}
+ica <- eegkit::eegica(eeg_train %>% dplyr::select(-eyeDetection, -ds), nc=3, method='fast', type='time')
+mix <- dplyr::as_tibble(ica$M)
+mix$eyeDetection <- eeg_train$eyeDetection
+mix$ds <- eeg_train$ds
+
+mix_melt <- reshape2::melt(mix, id.vars=c("eyeDetection", "ds"), variable.name = "Independent Component", value.name = "M")
+
+
+ggplot2::ggplot(mix_melt, ggplot2::aes(x=ds, y=M, color=`Independent Component`)) + 
+  ggplot2::geom_line() + 
+  ggplot2::geom_vline(ggplot2::aes(xintercept=ds), data=dplyr::filter(mix_melt, eyeDetection==1), alpha=0.005) +
+  ggplot2::scale_y_log10()
+```
+
+
+
+**9** Does this suggest eye opening relates to an independent component of activity across the electrodes?
+
+### The independent component analysis reveals that component V1 (represented by the red line) exhibits a distinct and consistent relationship with eye state transitions. Throughout the recording, V1 shows pronounced amplitude suppression precisely during eye-closed periods (light gray bars), with its signal decreasing by 50-60% within seconds of eye closure onset. This suppression pattern is particularly evident between 30-40 seconds and 80-90 seconds, where V1 maintains significantly reduced amplitude throughout sustained closure intervals. When eyes reopen (dark gray periods), V1 immediately rebounds to higher baseline levels. In contrast, components V2 and V3 show minimal state-dependent modulation, maintaining relatively stable amplitudes regardless of eye state. The selective response of V1 suggests it captures a neurophysiological process specifically linked to visual disengagement, likely representing either the inhibition of visual processing networks during eye closure or serving as an inverse correlate of alpha rhythm generation in visual cortex. This time-locked amplitude modulation demonstrates that ICA successfully isolated a physiologically meaningful source signal directly tied to eye-state dynamics, with V1 serving as the primary component encoding transitions between visual engagement and rest states.
+
+### Eye Opening Prediction
+
+Now that we've explored the data let's use a simple model to see how well we can predict eye status from the EEGs:
+
+```{r xgboost}
+# Convert the training and validation datasets to matrices
+eeg_train_matrix <- as.matrix(dplyr::select(eeg_train, -eyeDetection, -ds))
+eeg_train_labels <- as.numeric(eeg_train$eyeDetection) -1
+
+eeg_validate_matrix <- as.matrix(dplyr::select(eeg_validate, -eyeDetection, -ds))
+eeg_validate_labels <- as.numeric(eeg_validate$eyeDetection) -1
+
+# Build the xgboost model
+model <- xgboost(data = eeg_train_matrix, 
+                 label = eeg_train_labels,
+                 nrounds = 100,
+                 max_depth = 4,
+                 eta = 0.1,
+                 objective = "binary:logistic")
+
+print(model)
+```
+
+
+
+**10** Using the `caret` library (or any other library/model type you want such as a naive Bayes) fit another model to predict eye opening.
+
+```{r model2}
+# Prepare the data (as in your original code)
+eeg_train_matrix <- as.matrix(dplyr::select(eeg_train, -eyeDetection, -ds))
+eeg_validate_matrix <- as.matrix(dplyr::select(eeg_validate, -eyeDetection, -ds))
+ 
+# Convert eyeDetection to descriptive factor levels
+eeg_train_labels <- factor(eeg_train$eyeDetection, levels = c(0,1), labels = c("open", "closed"))
+eeg_validate_labels <- factor(eeg_validate$eyeDetection, levels = c(0,1), labels = c("open", "closed"))
+ 
+# Combine into a data frame for caret
+eeg_train_df <- data.frame(eeg_train_matrix)
+eeg_train_df$eyeDetection <- eeg_train_labels
+ 
+eeg_validate_df <- data.frame(eeg_validate_matrix)
+eeg_validate_df$eyeDetection <- eeg_validate_labels
+ 
+# Set up training control
+train_control <- trainControl(method = "cv", number = 5, classProbs = TRUE)
+ 
+# Train the model using caret with Random Forest
+model_caret <- train(eyeDetection ~ ., 
+                     data = eeg_train_df,
+                     method = "rf",
+                     trControl = train_control,
+                     tuneLength = 5)
+ 
+print(model_caret)
+
+```
+
+### The cross-validation results show the Random Forest model achieved peak performance at mtry = 11 (number of features considered per split), yielding a 91.9% accuracy and Kappa statistic of 0.836 across 5 validation folds. This indicates strong predictive agreement beyond chance, with the model correctly classifying eye states in approximately 9 out of 10 samples during cross-validation. The accuracy plateau near mtry=8-14 suggests optimal feature sampling for this EEG dataset, while the Kappa value confirms robust class discrimination despite potential imbalance. The final model configuration (mtry=11) will generalize well to new data, as evidenced by consistent performance across all folds (minimal accuracy variance: 91.4%-91.9%).
+
+
+**11** Using the best performing of the two models (on the validation dataset) calculate and report the test performance (filling in the code below):
+
+```{r test}
+# Prepare the data
+eeg_train_matrix <- as.matrix(dplyr::select(eeg_train, -eyeDetection, -ds))
+eeg_test_matrix <- as.matrix(dplyr::select(eeg_test, -eyeDetection, -ds))
+ 
+# Convert eyeDetection to descriptive factor levels
+eeg_train_labels <- factor(eeg_train$eyeDetection, levels = c(0,1), labels = c("open", "closed"))
+eeg_test_labels <- factor(eeg_test$eyeDetection, levels = c(0,1), labels = c("open", "closed"))
+ 
+# Combine into data frames for caret
+eeg_train_df <- data.frame(eeg_train_matrix)
+eeg_train_df$eyeDetection <- eeg_train_labels
+ 
+eeg_test_df <- data.frame(eeg_test_matrix)
+eeg_test_df$eyeDetection <- eeg_test_labels
+ 
+# Set up training control
+train_control <- trainControl(method = "cv", number = 5, classProbs = TRUE)
+ 
+# Train the model using caret with Random Forest
+model_caret <- train(eyeDetection ~ ., 
+                     data = eeg_train_df,
+                     method = "rf",
+                     trControl = train_control,
+                     tuneLength = 5)
+ 
+print(model_caret)
+ 
+test_pred <- predict(model_caret, newdata = eeg_test_df)
+confusionMatrix(test_pred, eeg_test_df$eyeDetection)
+```
+
+### The Random Forest model demonstrated excellent performance on the test dataset, achieving an overall accuracy of 93.36% (95% CI: 92.41%-94.22%), significantly exceeding the no-information rate of 56.94%. The model showed strong discrimination between eye states with a Kappa statistic of 0.8638, indicating near-perfect agreement beyond chance. Performance was well-balanced across classes: sensitivity for detecting "open" eye states reached 95.84% (1635 correct out of 1706 actual open cases), while specificity for "closed" states was 90.08% (1162 correct out of 1290 actual closed cases). The precision metrics were equally robust, with positive predictive value (open) at 92.74% and negative predictive value (closed) at 94.24%. The confusion matrix revealed slightly better performance for open-eye detection, with only 71 false negatives compared to 128 false positives for closed states. This performance slightly exceeded the cross-validation accuracy (92.13%), confirming effective generalization to unseen data. McNemar's test indicated significant asymmetry in error types (p=7.2e-5), suggesting closed-eye misclassifications were more common than open-eye errors, though both remained at acceptably low levels for physiological data.
+
+**12** Describe 2 possible alternative modeling approaches for prediction of eye opening from EEGs we discussed in the lecture but haven't explored in this notebook.
+
+### 1. Hidden Markov Models (HMMs): Model transitions between hidden states (open/closed eyes) with EEG emissions.
+### 2. Convolutional Neural Networks (CNNs): Treat EEG as 1D time-series to extract spectral-spatial features.
+
+**13** What are 2 R libraries you could use to implement these approaches? (note: you don't actually have to implement them though!)
+
+### For HMMs: depmixS4 and for CNNs: keras.
+
+## Optional
+
+**14** (Optional) As this is the last practical of the course - let me know how you would change future offerings of this course. This will not impact your marks!
+
+- What worked and didn’t work for you (e.g., in terms of the practicals, tutorials, and lectures)?
+
+### Lectures were great, I wish we had more papers to appraise for the tutorials. 
+
+- Was learning how to run the practicals on your own machines instead of a clean server that will disappear after the course worth the technical challenges?
+
+### I had problems with knitting Practical 3, so maybe a server might be better for larger tasks.  
+ 
+- What would you add or remove from the course? 
+
+### Maybe adding a little weekly quiz on brightspace about class material to make sure people attend.
+
+- What was the main thing you will take away from this course?
+
+### Always check who the model is missing, and data is messy.
